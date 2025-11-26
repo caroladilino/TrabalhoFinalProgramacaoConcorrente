@@ -1,1 +1,6 @@
--
+- Setor é uma struct que tem a thread (avião) e uma fila
+- Criar threads como structures - dentro teremos suas threads
+  -> no for iniciamos
+  -> igual thread semáforo 
+- Sempre que um avião quiser quiser entrar em um setor ele pede pro mecanismo de controle que irá avaliar sua prioridade e botar o avião em seu respectivo lugar na fila
+- Aviões terão rotas geradas aleatóriamente
