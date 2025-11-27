@@ -7,3 +7,7 @@
 - Sempre que um avião quiser quiser entrar em um setor ele pede pro mecanismo de controle que irá avaliar sua prioridade e botar o avião em seu respectivo lugar na fila
 
 - Aviões terão rotas geradas aleatóriamente
+
+após conversar com o professor:
+- aviões "nascem" em um setor específico
+- impôr limite qtd aviões <= qtd de setores
