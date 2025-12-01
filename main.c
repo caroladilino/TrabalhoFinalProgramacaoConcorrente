@@ -4,23 +4,17 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <semaphore.h>
-#define PRIORIDADE_BASE 1000
+#include <time.h>
 
-struct Aviao;
-struct Setor;
+#define PRIORIDADE_BASE 1000
 
 typedef struct Aviao{
     pthread_t thread;
     unsigned int id;
-    unsigned int prioridade;
-    unsigned int* rota;
+    unsigned int prioridade; 
+    struct Setor** rota;
     unsigned int rota_size;
-    unsigned int setor_atual;
-    sem_t espera_aviao;
-    sem_t espera_central;
-    sem_t na_fila;
-    pthread_mutex_t mutex_pedido;
-    Aviao* pedido_aviao;
+    unsigned int setor_atual; // É o INDICE dentro do vetor rota (0, 1, 2...)
 } Aviao;
 
 typedef struct Setor{
@@ -33,91 +27,126 @@ typedef struct Setor{
 typedef struct arg_central {
     Aviao* lista_avioes;
     Setor* lista_setores;
-    sem_t espera_aviao;
-    sem_t espera_central;
-    Aviao *pedido_aviao;
 } arg_central;
 
-void inicializar_sistema(int n_setores, int n_avioes, Setor* setores, Aviao* avioes, sem_t espera_aviao, sem_t espera_central, sem_t *sem_filas, pthread_mutex_t mutex_pedido){
+// Declaracao variaveis globais
+sem_t espera_aviao;
+sem_t espera_central;
+sem_t *na_fila;
+pthread_mutex_t mutex_pedido;
+Aviao* pedido_aviao = NULL;
+
+void inicializar_sistema(int n_setores, int n_avioes, Setor* setores, Aviao* avioes){
+    na_fila = malloc(n_avioes * sizeof(sem_t));
+    sem_init(&espera_aviao, 0, 0);
+    sem_init(&espera_central, 0, 0);
+    for (int i = 0; i < n_avioes; i++)
+        sem_init(&na_fila[i], 0, 0);
+    pthread_mutex_init(&mutex_pedido, NULL);
+    
     for(int i = 0 ; i < n_setores ; i++){
         Setor s;
         s.numero_setor = i;
         s.aviao_atual = NULL;
-        // Alocando espaço na memória para um vetor com tamanho de n_avioes
         s.fila = malloc(n_avioes * sizeof(Aviao));
         s.size = 0;
-        setores[i];
+        setores[i] = s;
     }
 
     for(int i = 0; i < n_avioes; i++) {
         Aviao a;
         a.id = i;
-        // rand() -> [0, 999]. Soma um para intervalo [1, 1000] -> nivel prioridade
         a.prioridade = (rand() % 1000) + 1;
-        // Tamanho máximo de uma rota [3, 14]
-        int rota_size = (rand() % n_setores) + 3;
-        a.rota = malloc(rota_size * sizeof(Setor));
-        a.rota[0] = i;
+        
+        // Proteção para rota não ser maior que setores disponíveis
+        int max_rota = (n_setores > 10) ? 10 : n_setores;
+        int rota_size = (rand() % max_rota) + 2; 
+
+        a.rota = malloc(rota_size * sizeof(unsigned int));
+        a.rota[0] = i % n_setores; // Distribui o inicio
         a.setor_atual = 0;
+        a.rota_size = rota_size;
+
         for (int j = 1; j < rota_size; j++) {
-            // Setores vão de [0, n_setores-1]
             int novo_setor = rand() % n_setores;
             if (novo_setor == a.rota[j-1])
                 novo_setor = (novo_setor + 1) % n_setores;
             a.rota[j] = novo_setor;
         }
 
-        a.espera_aviao = espera_aviao;
-        a.espera_central = espera_central;
-        a.na_fila = sem_filas[i];
-        a.mutex_pedido = mutex_pedido;
-        a.pedido_aviao = NULL;
         avioes[i] = a;
+        
+        // --- CORREÇÃO 1: Usar endereço do vetor persistente, não da variável local ---
+        setores[avioes[i].rota[0]].aviao_atual = &avioes[i];
 
-        printf("[AVIÃO %d] Criado!\n", a.id);
-        printf("[AVIÃO %d] Prioridade: %d\n", a.id, a.prioridade);
-        printf("[AVIÃO %d] Rota ", a.id);
+        printf("[AVIÃO %d] Criado! Rota: ", avioes[i].id);
         for (int j = 0; j < rota_size; j++) {
-            printf("S%d ", a.rota[j]);
-            if (j < rota_size-1)
-                printf("-> ");
+            printf("S%d ", avioes[i].rota[j]);
+            if (j < rota_size-1) printf("-> ");
         }
         printf("\n");
-
-        sem_init(&espera_aviao, 0, 0);
-        sem_init(&espera_central, 0, 0);
-        for (int i = 0; i < n_avioes; i++)
-            sem_init(&sem_filas[i], 0, 0);
-        pthread_mutex_init(&mutex_pedido, NULL);
     }
 }
 
 void * aviao_executa(void * arg) {
     Aviao *aviao = (Aviao *) arg;
-    pthread_mutex_lock(&aviao->mutex_pedido);
-    aviao->pedido_aviao = aviao;
-    sem_post(&aviao->espera_central);
-    sem_wait(&aviao->espera_aviao);
-    pthread__unlock(&aviao->mutex_pedido);
-    sem_wait(&aviao->na_fila);
+    
+    // --- CORREÇÃO 3: Loop para percorrer a rota ---
+    while(aviao->setor_atual < aviao->rota_size - 1) {
+        printf("[AVIAO %d] TENTANDO FALAR COM CENTRAL\n", aviao->id);
+        
+        pthread_mutex_lock(&mutex_pedido);
+        pedido_aviao = aviao;
+        sem_post(&espera_central); // Acorda central
+        sem_wait(&espera_aviao);   // Espera ACK da central
+        pthread_mutex_unlock(&mutex_pedido);
+        
+        sem_wait(&na_fila[aviao->id]); // Espera autorização de pouso/mudança
+        
+        sleep(1); // Simula tempo de voo
+    }
+    printf("[AVIAO %d] CHEGOU AO DESTINO FINAL!\n", aviao->id);
+    return NULL;
 }
 
 void * central_executa(void * arg) {
     arg_central *arguments = (arg_central *) arg;
     while (1) {
-        sem_wait(&arguments->espera_central);
-        Aviao *aviao_atual = arguments->pedido_aviao;
-        if (arguments->lista_setores[aviao_atual->rota[aviao_atual->setor_atual+1]].aviao_atual == NULL) {
+        sem_wait(&espera_central);
+        Aviao *aviao_atual = pedido_aviao;
+        
+        // ACK imediato para liberar o mutex do avião
+        sem_post(&espera_aviao);
+
+        // --- CORREÇÃO 2: Lógica correta de IDs de setor ---
+        int indice_rota = aviao_atual->setor_atual;
+        int id_setor_atual = aviao_atual->rota[indice_rota];
+        int id_proximo_setor = aviao_atual->rota[indice_rota + 1];
+
+        if (arguments->lista_setores[id_proximo_setor].aviao_atual == NULL) {
+            // Limpa o setor onde ele estava (usando o ID correto)
+            arguments->lista_setores[id_setor_atual].aviao_atual = NULL;
+            
+            // Atualiza índice
             aviao_atual->setor_atual++;
-
+            
+            // Ocupa novo setor
+            arguments->lista_setores[id_proximo_setor].aviao_atual = aviao_atual;
+            
+            printf(">>> [CENTRAL] AVIAO %d moveu de S%d para S%d\n", 
+                   aviao_atual->id, id_setor_atual, id_proximo_setor);
+        } else {
+            printf("... [CENTRAL] AVIAO %d EM ESPERA (S%d ocupado)\n", 
+                   aviao_atual->id, id_proximo_setor);
         }
+        
+        sem_post(&na_fila[aviao_atual->id]);
     }
-
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        printf("Uso: %s n_threads n_loops\n", argv[0]);
+        printf("Uso: %s n_avioes n_setores\n", argv[0]);
         return 1;
     }
 
@@ -134,19 +163,13 @@ int main(int argc, char* argv[]) {
     Aviao avioes[n_avioes];
     Setor setores[n_setores];
     pthread_t central;
-    sem_t espera_aviao;
-    sem_t espera_central;
-    sem_t sem_filas[n_avioes];
-    pthread_mutex_t mutex_pedido;
-    inicializar_sistema(n_setores, n_avioes, setores, avioes, espera_aviao, espera_central, sem_filas, mutex_pedido);
     
-    Aviao* pedido_aviao = NULL;
+    inicializar_sistema(n_setores, n_avioes, setores, avioes);
+    
     arg_central c_arg;
-    c_arg.espera_aviao = espera_aviao;
-    c_arg.espera_central = espera_central;
     c_arg.lista_avioes = avioes;
     c_arg.lista_setores = setores;
-    c_arg.pedido_aviao = pedido_aviao;
+    
     pthread_create(&central, NULL, central_executa, (void *) &c_arg);
 
     for (int i = 0; i < n_avioes; i++) {
@@ -154,10 +177,10 @@ int main(int argc, char* argv[]) {
     }
 
     for (int i = 0; i < n_avioes; i++) {
-        phtread_join(avioes[i], NULL);
+        pthread_join(avioes[i].thread, NULL);
     }
-    pthread_join(central, NULL);
-
+    
+    printf("Simulação finalizada.\n");
+    // pthread_join(central, NULL); // Central nunca termina, então deixamos o programa sair
+    return 0;
 }
-
-
