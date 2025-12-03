@@ -200,24 +200,13 @@ void timeout_check(Setor* lista_setores, int n_setores) {
         Fila* fila = &lista_setores[i].fila;
         for (int j = 0; j < fila->size; j++) {
             Aviao *a = fila->contents[j];
-            if (a == NULL) continue;
-            
             double espera = (double) (tempo_atual() - a->tempo_espera);
 
             if (espera > TIMEOUT) {
                 printf("[AVIAO %d] AVIÃO FICOU MUITO TEMPO NA FILA DE ESPERA. EXECUTANDO MANOBRA DE EMERGÊNCIA\n", a->id);
                 fflush(stdout);
                 
-                /* Remover do seu setor atual se estiver lá */
-                Setor* setor_atual = a->rota[a->setor_atual];
-                if (setor_atual->aviao_atual == a) {
-                    setor_atual->aviao_atual = NULL;
-                }
-                
-                /* Remover da fila */
                 remover_da_fila(fila, a);
-                
-                /* Despertar para refazer pedido */
                 a->refazer_pedido = 1;
                 sem_post(&aguardando_fila[a->id]);
             }
@@ -227,25 +216,15 @@ void timeout_check(Setor* lista_setores, int n_setores) {
 
 int deadlock_check(Aviao* aviao_inicial) { 
     Aviao* temp = aviao_inicial;
-    int iteracoes = 0;
-    int max_iteracoes = 500;
-    
     do { 
-        iteracoes++;
-        if (iteracoes > max_iteracoes) return 0; /* Proteção contra loops infinitos */
-        
-        if (temp == NULL) return 0;
-        if (temp->setor_atual + 1 >= temp->rota_size) return 0; /* Proteção: índice válido */
+        if (temp->setor_atual + 1 == temp->rota_size) return 0;
 
         Setor* proximo_setor = temp->rota[temp->setor_atual+1];
-        
-        /* Verificar se está na fila e é o primeiro */
-        if (proximo_setor->fila.size == 0 || proximo_setor->fila.contents == NULL || 
-            proximo_setor->fila.contents[0] == NULL || proximo_setor->fila.contents[0] != temp)
-            return 0;
 
-        temp = proximo_setor->aviao_atual;
-        if (temp == NULL) return 0;
+        if (proximo_setor->fila.size == 0 || proximo_setor->fila.contents[0] != temp)
+            return 0; 
+
+        temp = proximo_setor->aviao_atual; 
     } while (temp != aviao_inicial);
 
     return 1; /* Ciclo encontrado = DEADLOCK */ 
