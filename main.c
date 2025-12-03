@@ -4,10 +4,11 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <semaphore.h>
-#include <time.h>
+#include <sys/time.h>
 
 #define PRIORIDADE_BASE 1000
-#define TEMPO_BASE 10000
+#define TEMPO_BASE 500000
+#define TIMEOUT 5
 
 typedef struct Aviao{
     pthread_t thread;
@@ -16,6 +17,8 @@ typedef struct Aviao{
     struct Setor** rota;
     unsigned int rota_size;
     unsigned int setor_atual; // É o INDICE dentro do vetor rota (0, 1, 2...)
+    int refazer_pedido;
+    double tempo_espera;
 } Aviao;
 
 typedef struct Fila{
@@ -32,19 +35,29 @@ typedef struct Setor{
 } Setor;
 
 typedef struct arg_central {
-    Aviao* lista_avioes;
     Setor* lista_setores;
+    int n_setores;
 } arg_central;
 
 // Declaracao variaveis globais
+int avioes_ativos;
 sem_t espera_aviao;
 sem_t espera_central;
 sem_t *aguardando_fila;
 pthread_mutex_t mutex_pedido;
 pthread_mutex_t modificando_filas;
+pthread_mutex_t mutex_avioes_ativos;
 Aviao* pedido_aviao = NULL;
 
+double tempo_atual() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
+}
+
 void inicializar_sistema(int n_setores, int n_avioes, Setor* setores, Aviao* avioes){
+    avioes_ativos = n_avioes;
+
     aguardando_fila = malloc(n_avioes * sizeof(sem_t));
     sem_init(&espera_aviao, 0, 0);
     sem_init(&espera_central, 0, 0);
@@ -52,6 +65,7 @@ void inicializar_sistema(int n_setores, int n_avioes, Setor* setores, Aviao* avi
         sem_init(&aguardando_fila[i], 0, 0);
     pthread_mutex_init(&mutex_pedido, NULL);
     pthread_mutex_init(&modificando_filas, NULL);
+    pthread_mutex_init(&mutex_avioes_ativos, NULL);
 
     for (int i = 0; i < n_setores; i++) {
         setores[i].numero_setor = i;
@@ -64,7 +78,8 @@ void inicializar_sistema(int n_setores, int n_avioes, Setor* setores, Aviao* avi
 
     for (int i = 0; i < n_avioes; i++) {
         avioes[i].id = i;
-        avioes[i].prioridade = (rand() % 1000) + 1;
+        avioes[i].prioridade = (rand() % PRIORIDADE_BASE) + 1;
+        avioes[i].refazer_pedido = 0;
 
         int max_rota = (n_setores > 10) ? 10 : n_setores;
         int rota_size = (rand() % max_rota) + 2;
@@ -95,54 +110,148 @@ void inicializar_sistema(int n_setores, int n_avioes, Setor* setores, Aviao* avi
     }
 }
 
-void insert_by_priority(Fila *fila, Aviao* novo_aviao) {
-    /* Implementação segura: converte a fila circular para linear, insere
-       mantendo ordenação por prioridade (maior prioridade primeiro), e copia
-       de volta para o buffer circular com index = 0. Isso evita erros de
-       indexação com aritmética modular negativa. */
+void inserir_por_prioridade(Fila *fila, Aviao* novo_aviao) {
+    /* Implementação LINEAR: fila sempre começa do índice 0.
+       Se não há espaço no final mas há espaço total (elementos removidos),
+       compacta a fila movendo todos os elementos para o início.
+       Depois insere mantendo ordem por prioridade (maior primeiro). */
+    
     if (fila->size >= fila->max_size) {
-        // fila cheia: não inserimos
         printf("[WARN] fila cheia ao inserir aviao %u\n", novo_aviao->id);
         fflush(stdout);
         return;
     }
 
-    Aviao **tmp = malloc(fila->max_size * sizeof(Aviao*));
-    if (!tmp) return; // falha alocação (muito improvável)
-
-    // copiar conteúdo lógico (da posição index, em ordem) para tmp[0..size-1]
-    for (int i = 0; i < fila->size; i++) {
-        tmp[i] = fila->contents[(fila->index + i) % fila->max_size];
+    /* COMPACTAÇÃO: Se há espaço no vetor mas não no final (alguns foram removidos),
+       mover tudo para o início */
+    if (fila->index > 0) {
+        for (int i = 0; i < fila->size; i++) {
+            fila->contents[i] = fila->contents[fila->index + i];
+        }
+        fila->index = 0;
     }
 
-    // encontra posição de inserção: manter maior prioridade primeiro
+    /* Encontrar posição de inserção mantendo ordem por prioridade (maior primeiro) */
     int pos = 0;
-    while (pos < fila->size && novo_aviao->prioridade <= tmp[pos]->prioridade) pos++;
-
-    // move elementos à direita em tmp e insere
-    for (int i = fila->size; i > pos; --i) tmp[i] = tmp[i-1];
-    tmp[pos] = novo_aviao;
-    // copia tmp de volta para o buffer circular, resetando index para 0
-    for (int i = 0; i <= fila->size; ++i) {
-        fila->contents[i] = tmp[i];
+    while (pos < fila->size && novo_aviao->prioridade <= fila->contents[pos]->prioridade) {
+        pos++;
     }
-    fila->index = 0;
+
+    /* Mover elementos à direita para abrir espaço */
+    for (int i = fila->size; i > pos; i--) {
+        fila->contents[i] = fila->contents[i - 1];
+    }
+
+    /* Inserir novo avião */
+    novo_aviao->tempo_espera = tempo_atual();
+    fila->contents[pos] = novo_aviao;
     fila->size++;
-    free(tmp);
 }
 
-int deadlock_check(Aviao* aviao_inicial) {
+void inserir_no_fim(Fila *fila, Aviao* aviao) {
+    if (fila->size == fila->max_size) return;
+
+    aviao->tempo_espera = tempo_atual();
+    fila->contents[fila->size] = aviao;
+    fila->size++;
+}
+
+void remover_da_fila(Fila *fila, Aviao* aviao) {
+    if (fila->size == 0) return;
+
+    /* Buscar posição do avião na fila */
+    int pos = -1;
+    for (int i = 0; i < fila->size; i++) {
+        if (fila->contents[i] != NULL && fila->contents[i]->id == aviao->id) {
+            pos = i;
+            break;
+        }
+    }
+
+    if (pos == -1) return; /* Não encontrou */
+
+    /* Remover deslocando para trás */
+    for (int j = pos; j < fila->size - 1; j++) {
+        fila->contents[j] = fila->contents[j + 1];
+    }
+
+    fila->contents[fila->size - 1] = NULL;
+    fila->size--;
+}
+
+void acordar_proximo(Setor *s) {
+    Fila *fila = &s->fila;
+    if (fila->size == 0) return;
+
+    Aviao *prox = fila->contents[0];
+
+    for (int i = 0; i < fila->size - 1; i++)
+        fila->contents[i] = fila->contents[i + 1];
+
+    fila->contents[fila->size - 1] = NULL;
+    fila->size--;
+    fila->index = 0;
+
+    sem_post(&aguardando_fila[prox->id]);
+}
+
+void timeout_check(Setor* lista_setores, int n_setores) {
+    for (int i = 0; i < n_setores; i++) {
+        Fila* fila = &lista_setores[i].fila;
+        for (int j = 0; j < fila->size; j++) {
+            Aviao *a = fila->contents[j];
+            if (a == NULL) continue;
+            
+            double espera = (double) (tempo_atual() - a->tempo_espera);
+
+            if (espera > TIMEOUT) {
+                printf("[AVIAO %d] AVIÃO FICOU MUITO TEMPO NA FILA DE ESPERA. EXECUTANDO MANOBRA DE EMERGÊNCIA\n", a->id);
+                fflush(stdout);
+                
+                /* Remover do seu setor atual se estiver lá */
+                Setor* setor_atual = a->rota[a->setor_atual];
+                if (setor_atual->aviao_atual == a) {
+                    setor_atual->aviao_atual = NULL;
+                }
+                
+                /* Remover da fila */
+                remover_da_fila(fila, a);
+                
+                /* Despertar para refazer pedido */
+                a->refazer_pedido = 1;
+                sem_post(&aguardando_fila[a->id]);
+            }
+        }
+    }
+}
+
+int deadlock_check(Aviao* aviao_inicial) { 
     Aviao* temp = aviao_inicial;
-    do {
-        Setor* setor_atual = temp->rota[temp->setor_atual];
-        temp = setor_atual->fila.contents[setor_atual->fila.index];
-    } while (temp != aviao_inicial && temp != NULL);
+    int iteracoes = 0;
+    int max_iteracoes = 500;
+    
+    do { 
+        iteracoes++;
+        if (iteracoes > max_iteracoes) return 0; /* Proteção contra loops infinitos */
+        
+        if (temp == NULL) return 0;
+        if (temp->setor_atual + 1 >= temp->rota_size) return 0; /* Proteção: índice válido */
 
-    if (temp == aviao_inicial)
-        return 1;
+        Setor* proximo_setor = temp->rota[temp->setor_atual+1];
+        
+        /* Verificar se está na fila e é o primeiro */
+        if (proximo_setor->fila.size == 0 || proximo_setor->fila.contents == NULL || 
+            proximo_setor->fila.contents[0] == NULL || proximo_setor->fila.contents[0] != temp)
+            return 0;
 
-    return 0;
+        temp = proximo_setor->aviao_atual;
+        if (temp == NULL) return 0;
+    } while (temp != aviao_inicial);
+
+    return 1; /* Ciclo encontrado = DEADLOCK */ 
 }
+
+
 
 void * aviao_executa(void * arg) {
     Aviao *aviao = (Aviao *) arg;
@@ -159,83 +268,101 @@ void * aviao_executa(void * arg) {
         pthread_mutex_unlock(&mutex_pedido);
         
         sem_wait(&aguardando_fila[aviao->id]); // Espera autorização de pouso/mudança
-        Setor *proximo_setor = aviao->rota[aviao->setor_atual+1];
-        Setor *setor_antigo = aviao->rota[aviao->setor_atual];
-        proximo_setor->aviao_atual = aviao;
-        aviao->setor_atual++;
-        setor_antigo->aviao_atual = NULL;
-        // MUtex
-        pthread_mutex_lock(&modificando_filas);
-        Fila *fila_setor_antigo = &setor_antigo->fila;
-        if (fila_setor_antigo->size != 0){
-            Aviao *aviao_primeiro_fila = fila_setor_antigo->contents[fila_setor_antigo->index];
-            int old_index = fila_setor_antigo->index;
-            fila_setor_antigo->index = (fila_setor_antigo->index + 1) % fila_setor_antigo->max_size;
-            fila_setor_antigo->size--;
-            fila_setor_antigo->contents[old_index] = NULL;
-            if (aviao_primeiro_fila != NULL)
-                sem_post(&aguardando_fila[aviao_primeiro_fila->id]);
+        if (!aviao->refazer_pedido){
+            pthread_mutex_lock(&modificando_filas);
+            Setor *proximo_setor = aviao->rota[aviao->setor_atual+1];
+            Setor *setor_antigo = aviao->rota[aviao->setor_atual];
+            proximo_setor->aviao_atual = aviao;
+            aviao->setor_atual++;
+            setor_antigo->aviao_atual = NULL;
+            acordar_proximo(setor_antigo);
+            pthread_mutex_unlock(&modificando_filas);
+            
+            Setor* setor_atual = aviao->rota[aviao->setor_atual];
+            printf("[AVIAO %d] VOANDO PARA SETOR %d\n", aviao->id, setor_atual->numero_setor);
+            fflush(stdout);
+            usleep(TEMPO_BASE + rand() % 4000); // Simula tempo de voo [2 segundos, 6 segundos]
+            printf("[AVIAO %d] CHEGOU NO SETOR %d\n", aviao->id, setor_atual->numero_setor);
+            fflush(stdout);
+        } else {
+            usleep(5000);
+            aviao->refazer_pedido = 0;
         }
-        pthread_mutex_unlock(&modificando_filas);
         
-        Setor* setor_atual = aviao->rota[aviao->setor_atual];
-        printf("[AVIAO %d] VOANDO PARA SETOR %d\n", aviao->id, setor_atual->numero_setor);
-        fflush(stdout);
-        // usleep(TEMPO_BASE + (rand() % 4000)); // Simula tempo de voo [2 segundos, 6 segundos]
-        printf("[AVIAO %d] CHEGOU NO SETOR %d\n", aviao->id, setor_atual->numero_setor);
-        fflush(stdout);
     }
     printf("[AVIAO %d] CHEGOU AO DESTINO FINAL!\n", aviao->id);
     fflush(stdout);
-    // Liberando setor final
+    /* Liberando setor final */
     pthread_mutex_lock(&modificando_filas);
     Setor* setor_final = aviao->rota[aviao->setor_atual];
-    Aviao* proximo_na_fila = setor_final->fila.contents[setor_final->fila.index];
-    if (proximo_na_fila != NULL) {
-        setor_final->fila.index = (setor_final->fila.index + 1) % setor_final->fila.max_size;
-        sem_post(&aguardando_fila[proximo_na_fila->id]);
-    }
+    setor_final->aviao_atual = NULL; /* Liberar o setor para outros aviões */
+    acordar_proximo(setor_final);
     printf("[AVIAO %d] LIBEROU O DESTINO FINAL!\n", aviao->id);
     fflush(stdout);
     pthread_mutex_unlock(&modificando_filas);
+
+    pthread_mutex_lock(&mutex_avioes_ativos);
+    avioes_ativos--;
+    pthread_mutex_unlock(&mutex_avioes_ativos);
+
     return NULL;
 }
 
 void * central_executa(void * arg) {
     arg_central *arguments = (arg_central *) arg;
     while (1) {
-        sem_wait(&espera_central);
-        Aviao* aviao_atual = pedido_aviao;
-        Setor* proximo_setor = aviao_atual->rota[aviao_atual->setor_atual+1];
 
-        if (proximo_setor->aviao_atual == NULL) {
-            sem_post(&aguardando_fila[aviao_atual->id]);
-        } else {
-            pthread_mutex_lock(&modificando_filas);
-            Fila* fila_proximo_setor = &proximo_setor->fila;
-            insert_by_priority(fila_proximo_setor, aviao_atual);
-            printf("[AVIAO %d] ENTROU NA FILA DO SETOR %d\n", aviao_atual->id, proximo_setor->numero_setor);
-            fflush(stdout);
-            if (deadlock_check(aviao_atual)) {
-                // Libera setores do avião atual
-                printf("[AVIAO %d] EXECUTANDO MANOBRA DE EMERGÊNCIA!\n", aviao_atual->id);
-                fflush(stdout);
-                Setor* setor_atual = aviao_atual->rota[aviao_atual->setor_atual];
-                setor_atual->aviao_atual = NULL;
-                Aviao* aviao_na_fila = setor_atual->fila.contents[setor_atual->fila.index];
-                setor_atual->fila.index = (setor_atual->fila.index + 1) % setor_atual->fila.max_size;
-                sem_post(&aguardando_fila[aviao_na_fila->id]);
-            }
-            pthread_mutex_unlock(&modificando_filas);
+        pthread_mutex_lock(&mutex_avioes_ativos);
+        if (avioes_ativos == 0) {
+            pthread_mutex_unlock(&mutex_avioes_ativos);
+            break; 
         }
-        sem_post(&espera_aviao);
+        pthread_mutex_unlock(&mutex_avioes_ativos);
+
+        pthread_mutex_lock(&modificando_filas);
+        timeout_check(arguments->lista_setores, arguments->n_setores);
+        pthread_mutex_unlock(&modificando_filas);
+
+
+        if (!sem_trywait(&espera_central)) {
+            Aviao* aviao_atual = pedido_aviao;
+            Setor* proximo_setor = aviao_atual->rota[aviao_atual->setor_atual+1];
+
+            /* IMPORTANTE: manter lock curto - só para verificação */
+            pthread_mutex_lock(&modificando_filas);
+            
+            if (proximo_setor->aviao_atual == NULL) {
+                /* Setor livre - liberar avião para entrar */
+                pthread_mutex_unlock(&modificando_filas);
+                sem_post(&aguardando_fila[aviao_atual->id]);
+            } else {
+                /* Setor ocupado - colocar na fila */
+                Fila* fila_proximo_setor = &proximo_setor->fila;
+                inserir_por_prioridade(fila_proximo_setor, aviao_atual);
+                printf("[AVIAO %d] ENTROU NA FILA DO SETOR %d\n", aviao_atual->id, proximo_setor->numero_setor);
+                fflush(stdout);
+                if (deadlock_check(aviao_atual)) {
+                    // Libera setores do avião atual
+                    printf("[AVIAO %d] EXECUTANDO MANOBRA DE EMERGÊNCIA!\n", aviao_atual->id);
+                    fflush(stdout);
+                    Setor* setor_atual = aviao_atual->rota[aviao_atual->setor_atual];
+                    setor_atual->aviao_atual = NULL;
+                    acordar_proximo(setor_atual);
+                }
+                pthread_mutex_unlock(&modificando_filas);
+            }
+            
+            sem_post(&espera_aviao);
+        }
+
+        usleep(20000);
     }
+
+    return NULL;
 }
 
 void finalizar_sistema(pthread_t central, Setor* setores, Aviao* avioes, int n_setores, int n_avioes){
     /* Cancela e espera a thread da central */
-    pthread_cancel(central);
-    pthread_join(central, NULL);
 
     /* Destrói semáforos */
     sem_destroy(&espera_aviao);
@@ -248,6 +375,8 @@ void finalizar_sistema(pthread_t central, Setor* setores, Aviao* avioes, int n_s
 
     /* Destrói mutex */
     pthread_mutex_destroy(&mutex_pedido);
+    pthread_mutex_destroy(&modificando_filas);
+    pthread_mutex_destroy(&mutex_avioes_ativos);
 
     /* Libera as filas dos setores */
     for (int i = 0; i < n_setores; i++) {
@@ -274,8 +403,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    unsigned int seed = (argc >= 4) ? atoi(argv[3]) : time(NULL);
-    srand(seed);
+    srand(time(NULL));
 
     Aviao avioes[n_avioes];
     Setor setores[n_setores];
@@ -284,8 +412,8 @@ int main(int argc, char* argv[]) {
     inicializar_sistema(n_setores, n_avioes, setores, avioes);
     
     arg_central c_arg;
-    c_arg.lista_avioes = avioes;
     c_arg.lista_setores = setores;
+    c_arg.n_setores = n_setores;
     
     pthread_create(&central, NULL, central_executa, (void *) &c_arg);
 
@@ -296,6 +424,8 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < n_avioes; i++) {
         pthread_join(avioes[i].thread, NULL);
     }
+
+    pthread_join(central, NULL);
     
     printf("Simulação finalizada.\n");
     fflush(stdout);
